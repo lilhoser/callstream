@@ -1,3 +1,4 @@
+#include "../../trunk-recorder/call_concluder/call_concluder.h"
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
 #include "../../trunk-recorder/recorders/recorder.h"
 #include <boost/dll/alias.hpp> // for BOOST_DLL_ALIAS
@@ -9,6 +10,9 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_future.hpp>
 #include <boost/thread/locks.hpp>
+#include <boost/exception/diagnostic_information.hpp>
+#include <curl/curl.h>
+#include <chrono>
 
 using namespace boost::asio;
 namespace asio = boost::asio;
@@ -36,6 +40,27 @@ public:
   std::string json_string;
   std::shared_ptr<boost::shared_mutex> mutex; // protects samples
   std::vector<int16_t> samples;
+};
+
+class sftp_buffer_info_t {
+  public:
+    const char* pointer;
+    size_t size_left;
+};
+
+class sftp_client_info_t {
+  public:
+    std::string server_address;
+    std::string user;
+    std::string password;
+    std::string dest;
+    bool enabled;
+    bool verbose;
+
+    sftp_client_info_t() {
+      enabled = false;
+      verbose = false;
+    }
 };
 
 class callstream_t { 
@@ -74,6 +99,22 @@ class Call_Stream : public Plugin_Api {
     if (!config_data.contains("streams")) {
       BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: at least one stream is required";
       return 1;
+    }
+    if (config_data.contains("sftp_info")) {
+      auto info = config_data["sftp_info"];
+      if (!info.contains("server_address") || !info.contains("user") ||
+          !info.contains("password") || !info.contains("dest")) {
+            BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: invalid SFTP info.";
+            return 1;
+      }
+      if (info.contains("verbose")) {
+        sftp_client_info.verbose = info.value("verbose", false);
+      }
+      sftp_client_info.server_address = info["server_address"];
+      sftp_client_info.user = info["user"];
+      sftp_client_info.password = info["password"];
+      sftp_client_info.dest = info["dest"];
+      sftp_client_info.enabled = true;
     }
     endpoint.address(asio::ip::address::from_string(config_data["address"]));
     endpoint.port(config_data["port"]);
@@ -247,6 +288,16 @@ private:
   }
 
   void send(callstream_t* callstream, calldata_t* call_data, std::string unique_id) {
+    //
+    // Optionally send to an sftp server (sync)
+    //
+    if (sftp_client_info.enabled) {
+      send_sftp(call_data);
+    }
+
+    //
+    // Stream to client (async)
+    //
     try {
       auto sock = std::make_unique<tcp::socket>(g_context); // run on I/O worker thread we created
       sock->open(tcp::v4());
@@ -290,7 +341,117 @@ private:
     destroy_call(callstream, unique_id);
   }
 
+  void send_sftp(calldata_t* call_data) {
+    //
+    // Init CURL
+    //
+    CURL* curl = curl_easy_init();
+    if(!curl) {
+      BOOST_LOG_TRIVIAL(error) << "libcallstream: CURL object null";
+      return;
+    }
+
+    //
+    // Create a flattened buffer
+    //
+    std::vector<boost::asio::const_buffer> send_buffers; // order matters!
+    send_buffers.push_back(buffer(&call_data->magic, sizeof(call_data->magic)));
+    send_buffers.push_back(buffer(&call_data->json_length, sizeof(call_data->json_length)));
+    send_buffers.push_back(buffer(&call_data->sample_count, sizeof(call_data->sample_count)));
+    send_buffers.push_back(buffer(call_data->json_string));
+    send_buffers.push_back(buffer(call_data->samples.data(), call_data->sample_count * sizeof(int16_t)));
+    size_t total_size = 0;
+    BOOST_FOREACH(auto& entry, send_buffers) {
+      total_size += entry.size();
+    }
+    auto buffer = (char*)calloc(total_size, 1);
+    if (buffer == nullptr) {
+      BOOST_LOG_TRIVIAL(error) << "libcallstream: out of memory";
+      return;
+    }
+    auto ptr = (char*)buffer;
+    BOOST_FOREACH(auto& entry, send_buffers) {
+      memcpy(ptr, (char*)entry.data(), entry.size());
+      ptr += entry.size();
+    }
+
+    //
+    // Destination folder on server is in the format:
+    //    [destination specified in config]/Year/Month/Day/Hour
+    //
+    time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    tm local_tm = *localtime(&tt);
+    auto year = 1900 + local_tm.tm_year;
+    auto month = local_tm.tm_mon + 1;
+    auto day = local_tm.tm_mday;
+    auto hour = local_tm.tm_hour;
+    auto min = local_tm.tm_min;
+    auto sec = local_tm.tm_sec;
+    //
+    // Setup CURL
+    //
+    try {
+      sftp_buffer_info_t buffer_info;
+      buffer_info.pointer = (char*)buffer;
+      buffer_info.size_left = total_size;
+      std::string config_dest = sftp_client_info.dest;
+      std::string filename = fmt::format("{}-{}-{}.{}{}{}.bin", year, month, day, hour, min, sec);
+      std::string destination;
+      if (!config_dest.empty()) {
+        destination = fmt::format("{}/{}/{}/{}/{}/{}",
+          config_dest, year, month, day, hour, filename);
+      }
+      else {
+        destination = fmt::format("{}/{}/{}/{}/{}",
+          year, month, day, hour, filename);
+      }
+      std::string url = fmt::format("sftp://{}:{}@{}/{}",
+        sftp_client_info.user , sftp_client_info.password, sftp_client_info.server_address, destination);
+      if (sftp_client_info.verbose) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+      }
+      curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
+      curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+      curl_easy_setopt(curl, CURLOPT_FTP_CREATE_MISSING_DIRS, (long)CURLFTP_CREATE_DIR_RETRY);
+      curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+      curl_easy_setopt(curl, CURLOPT_READFUNCTION, +[](char *ptr, size_t size, size_t nmemb, void* ptrbuffer_info) -> size_t {
+        auto info = (sftp_buffer_info_t*)ptrbuffer_info;
+        size_t max = size * nmemb;
+        if(max < 1) {
+          return 0;
+        }
+        if(info->size_left) {
+          size_t copylen = max;
+          if(copylen > info->size_left) {
+            copylen = info->size_left;
+          }
+          memcpy(ptr, info->pointer, copylen);
+          info->pointer += copylen;
+          info->size_left -= copylen;
+          return copylen;
+        }
+        return 0; 
+      });
+      curl_easy_setopt(curl, CURLOPT_READDATA, &buffer_info);
+      curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)total_size);
+      auto result = curl_easy_perform(curl);
+      if(result != CURLE_OK) {
+        BOOST_LOG_TRIVIAL(error) << "libcallstream: CURL failure: " << curl_easy_strerror(result);
+      }
+      else {
+        BOOST_LOG_TRIVIAL(info) << "libcallstream: sent call data (" << total_size << " bytes) to SFTP server";
+      }
+    }
+    catch(...) {
+      auto ex = boost::current_exception_diagnostic_information();
+      BOOST_LOG_TRIVIAL(info) << "libcallstream: CURL exception" << ex;
+    }
+    curl_easy_cleanup(curl);
+    free(buffer);
+  }
+
   tcp::endpoint endpoint;
+  sftp_client_info_t sftp_client_info;
 };
 
 BOOST_DLL_ALIAS(

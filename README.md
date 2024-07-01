@@ -32,7 +32,14 @@ Add the following code to your trunk-recorder's JSON configuration:
                     "TGID":0,
                     "shortName":"<system name>"
                 }
-            ]
+            ],
+            "sftp_info":{
+                "server_address": "<address>",
+                "user": "<user>",
+                "password": "<password>",
+                "dest": "myfolder/mysubfolder",
+                "verbose": false
+            }
         }
     ]
 ```
@@ -49,6 +56,8 @@ You might consider disabling these [per-system settings](https://trunkrecorder.c
 * `audioArchive` - this setting controls whether or not trunk-recorder writes WAV files to disk after it processes calls. Since `callstream` sends the same data over the wire to your server, this is wasted processing.
 * `compressWav` - this setting controls whether WAVs are compressed before writing them to disk (something needed for other plugins like openmhz), which is unnecessary if `audioArchive` is disabled
 * `transmissionArchive` - this setting should always be disabled unless you are performing low-level diagnostics
+
+The `sftp_info` block specifies an SFTP server to upload callstream records. This block is optional and can be removed. It is a useful option if you don't want to rely on a live streaming capability or would prefer to backup all callstream records for offline consumption (perhaps in addition to live streaming).
 
 # Run
 
@@ -150,3 +159,42 @@ I dunno, I like pizza and Teenage Mutant Ninja Turtles, so it seemed to work.
 		}
 ```
 * use the C++ extension's "run and debug" sub-menu, beneath the "run and debug" tile on the left and click the green play button to start
+
+# Self-signed certificates when using CURL and SFTP
+
+If you're using the `sftp_info` configuration parameter for `callstream`, you'll want to read and understand this section.
+
+## Problem and solution
+
+Under the hood, `callstream` uses `libcurl` to communicate with the target SFTP server. In the situation where the SFTP server is using a self-signed certificate (common for home network setups), you will need to add the PEM certificate of all intermediate and root signing authorities to your client system's trusted cert store. For SSH, this location is either your user profile `~/.ssh/known_hosts` or systemwide `/etc/ssh/ssh_known_hosts`. Simply add the output of `ssh-keyscan -H <address>` to one of these files and restart SSH `sudo systemctl restart ssh`. To test that it worked, after restarting SSH, run `curl --user <user> sftp://<address> -debug`.
+
+## Details
+
+Without installing the necessary Certificate Authority (CA) certs on the client machine, curl will complain:
+
+```	
+lilhoser@omicrontheta:~/trunk-build$ curl --user pizzawave sftp://192.168.1.183 -debug
+Enter host password for user 'pizzawave':
+curl: (60) SSL peer certificate or SSH remote key was not OK
+More details here: https://curl.se/docs/sslcerts.html
+
+curl failed to verify the legitimacy of the server and therefore could not
+establish a secure connection to it. To learn more about this situation and
+how to fix it, please visit the web page mentioned above.
+```
+
+The issue is the server is responding to curl's SFTP handshake request with a self-signed certificate whose root (or intermediate CAs, if any) are not trusted by the requesting client machine. Because curl defaults to enforcing peer verification, the request will fail with [CURLE_PEER_FAILED_VALIDATION](https://curl.se/mail/lib-2020-07/0023.html). While we could tell CURL not to validate the peer at all (command line `-k` or [`CURLOPT_SSL_VERIFYPEER`](https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYPEER.html)), this disables all security features of SSH/SFTP. For TLS-based protocols (such as FTP-S, not to be confused with S-FTP!), we could simply tell CURL where the CA cert is inside our request using [CURLOPT_CAINFO](https://curl.se/libcurl/c/CURLOPT_CAINFO.html). However SFTP is ssh-based, not TLS, and uses its own cryptographic library where CA certs are supplied in host files. So we solve this by adding the CA cert(s) to SSH's `known_hosts` file. To make it systemwide, we can put the cert into `/etc/ssh/ssh_known_hosts`.  Read more about SSL certificate verification in CURL [here](https://curl.se/docs/sslcerts.html).
+
+How to use openssl to verify you have the right signing cert:
+
+```
+lilhoser@omicrontheta:~/trunk-build$ openssl verify -CAfile ca-cert.pem server-cert.pem
+
+server-cert.pem: OK
+```
+
+How to use openssl to sniff SSL handshake:
+
+```
+openssl s_client -connect <address>:<port> -showcerts
+```
