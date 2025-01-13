@@ -15,6 +15,12 @@ This plugin was designed to work with [pizzawave](https://github.com/lilhoser/pi
 add_subdirectory(plugins/callstream)
 ```
 * [Rebuild trunk-recorder](https://trunkrecorder.com/docs/Install/INSTALL-LINUX)
+```
+cd trunk-build
+cmake ../trunk-recorder
+make
+sudo make install
+```
 
 # Configure
 
@@ -25,8 +31,16 @@ Add the following code to your trunk-recorder's JSON configuration:
         {
             "name":"callstream",
             "library":"libcallstream.so",
-            "address":"<ip address of server>",
-            "port":<port of server>,
+            "clients":[
+                {
+                    "address":"192.168.1.122",
+                    "port":9123
+                },
+                {
+                    "address":"192.168.1.54",
+                    "port":9123
+                }
+            ],
             "streams":[
                 {
                     "TGID":0,
@@ -46,18 +60,17 @@ Add the following code to your trunk-recorder's JSON configuration:
 
 Make sure you set the global `audioStreaming` to `true`.
 
-* `Ip address of server`: this is the IP address of the machine that will receive the streamed calls. The `callstream` plugin acts like a client, transmitting call data to a remote server. The plugin was designed with [pizzawave](https://github.com/lilhoser/pizzawave) being the server, but you can easily write your own server and do whatever you want to with the call data.
-* `Port of server`: the port your server is listening on; this is configurable in pizzawave
+* `clients`: specify up to 6 clients (address and port) that will receive the streamed calls from this plugin. The callstream plugin was designed to communicate with [pizzawave](https://github.com/lilhoser/pizzawave) application on the remote client, but you can easily write your own client and do whatever you want to with the call data.
 * `System name`: this is the name of the trunk-recorder system from your configuration file.
 
 If TGID is set to 0, all calls from all talkgroups will be sent. If TGID is set to a specific decimal value, only calls from that talkgroup will be sent.
 
 You might consider disabling these [per-system settings](https://trunkrecorder.com/docs/CONFIGURE) in trunk-recorder, if you're not using them for another purpose:
-* `audioArchive` - this setting controls whether or not trunk-recorder writes WAV files to disk after it processes calls. Since `callstream` sends the same data over the wire to your server, this is wasted processing.
+* `audioArchive` - this setting controls whether or not trunk-recorder writes WAV files to disk after it processes calls. Since `callstream` sends the same data over the wire to your clients, this is wasted processing.
 * `compressWav` - this setting controls whether WAVs are compressed before writing them to disk (something needed for other plugins like openmhz), which is unnecessary if `audioArchive` is disabled
 * `transmissionArchive` - this setting should always be disabled unless you are performing low-level diagnostics
 
-The `sftp_info` block specifies an SFTP server to upload callstream records. This block is optional and can be removed. It is a useful option if you don't want to rely on a live streaming capability or would prefer to backup all callstream records for offline consumption (perhaps in addition to live streaming).
+The `sftp_info` block specifies an SFTP server to upload callstream records. This block is optional and can be removed. It is a useful option if you don't want to rely on a live streaming capability or would prefer to backup all callstream records for offline consumption (perhaps in addition to live streaming). In pizzawave parlance, this is known as an "offline capture".
 
 # Run
 
@@ -65,7 +78,7 @@ Once you have rebuilt trunk-recorder with the plugin code and modified your trun
 
 # Data Protocol
 
-If you're writing your own server to consume call data sent by this plugin, you will need to read the data as follows:
+If you're writing your own client to consume call data sent by this plugin, you will need to read the data as follows:
 
 | Offset      | Length (bytes) |  Description            |
 | ----------- | -------------- | ----------------------- |

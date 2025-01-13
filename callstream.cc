@@ -85,15 +85,13 @@ class Call_Stream : public Plugin_Api {
 
   public:
   
-  Call_Stream() {}
+  Call_Stream() {
+    num_clients = 0;
+  }
 
   int parse_config(json config_data) override {
-    if (!config_data.contains("address")) {
-      BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: address is required";
-      return 1;
-    }
-    if (!config_data.contains("port")) {
-      BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: port is required";
+    if (!config_data.contains("clients")) {
+      BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: clients block is required";
       return 1;
     }
     if (!config_data.contains("streams")) {
@@ -116,13 +114,25 @@ class Call_Stream : public Plugin_Api {
       sftp_client_info.dest = info["dest"];
       sftp_client_info.enabled = true;
     }
-    endpoint.address(asio::ip::address::from_string(config_data["address"]));
-    endpoint.port(config_data["port"]);
+    for (json client : config_data["clients"]) {
+      if (++num_clients > 6)
+      {
+        BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: max 6 clients.";
+        return 1;
+      }
+      if (!client.contains("address") || !client.contains("port")) {
+        BOOST_LOG_TRIVIAL(info) << "Invalid plugin configuration: client object must have address and port.";
+        return 1;
+      }
+      clients[num_clients-1].address(asio::ip::address::from_string(client["address"]));
+      clients[num_clients-1].port(client["port"]);
+      BOOST_LOG_TRIVIAL(info) << "streaming to client " << clients[num_clients-1].address() <<":" << clients[num_clients-1].port();
+    }
     for (json element : config_data["streams"]) {
       auto callstream = std::make_shared<callstream_t>();
       callstream->TGID = element["TGID"];
       callstream->short_name = element.value("shortName", "");
-      BOOST_LOG_TRIVIAL(info) << "streaming from TGID " << callstream->TGID << " on System " << callstream->short_name << " to " << endpoint.address() <<":" << endpoint.port();
+      BOOST_LOG_TRIVIAL(info) << "streaming from TGID " << callstream->TGID << " on System " << callstream->short_name;
       g_callstreams.push_back(callstream);
     }
     return 0;
@@ -295,17 +305,23 @@ private:
       send_sftp(call_data);
     }
 
-    //
-    // Stream to client (async)
-    //
+    for (int i = 0; i < num_clients; i++) {
+      send_to_client(clients[i], callstream, call_data, unique_id);
+    }
+    
+    destroy_call(callstream, unique_id);
+  }
+
+  void send_to_client(tcp::endpoint& client, callstream_t* callstream, calldata_t* call_data, std::string unique_id) {
+    auto address = client.address().to_string();
     try {
       auto sock = std::make_unique<tcp::socket>(g_context); // run on I/O worker thread we created
       sock->open(tcp::v4());
       sock->set_option(boost::asio::socket_base::keep_alive(true));
       std::chrono::milliseconds span(1000);
-      std::future<void> status = sock->async_connect(endpoint, asio::use_future);
+      std::future<void> status = sock->async_connect(client, asio::use_future);
       if (status.wait_for(span) == std::future_status::timeout) {
-        BOOST_LOG_TRIVIAL(error) << "libcallstream: no server available, ignoring";
+        BOOST_LOG_TRIVIAL(error) << "libcallstream: client " << address << " unavailable, ignoring";
         destroy_call(callstream, unique_id);
         return;
       }
@@ -322,23 +338,22 @@ private:
         total_size += entry.size();
       }
       if (bytesSent != total_size) {
-        BOOST_LOG_TRIVIAL(error) << "libcallstream: only sent " << bytesSent << " of " << total_size;
+        BOOST_LOG_TRIVIAL(error) << "libcallstream: only sent " << bytesSent << " of " << total_size << " to client " << address;
       }
       else {
-        BOOST_LOG_TRIVIAL(info) << "libcallstream: sent call data (" << total_size << " bytes) to server";
+        BOOST_LOG_TRIVIAL(info) << "libcallstream: sent call data (" << total_size << " bytes) to client " << address;
       }
     }
     catch(const boost::system::system_error& ex) {
       if ((boost::asio::error::eof == ex.code()) ||
           (boost::asio::error::connection_reset == ex.code()) ||
           (boost::asio::error::broken_pipe == ex.code())) {
-        BOOST_LOG_TRIVIAL(warning) << "libcallstream: socket send failed, client has disconnected";
+        BOOST_LOG_TRIVIAL(warning) << "libcallstream: socket send failed, client " << address << " has disconnected";
       }
       else {
-        BOOST_LOG_TRIVIAL(error) << "libcallstream: socket send failed: " << ex.what();
+        BOOST_LOG_TRIVIAL(error) << "libcallstream: socket send failed for client " << address << ": " << ex.what();
       }
     }
-    destroy_call(callstream, unique_id);
   }
 
   void send_sftp(calldata_t* call_data) {
@@ -450,7 +465,8 @@ private:
     free(buffer);
   }
 
-  tcp::endpoint endpoint;
+  tcp::endpoint clients[6];
+  int num_clients;
   sftp_client_info_t sftp_client_info;
 };
 
