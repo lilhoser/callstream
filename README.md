@@ -65,6 +65,96 @@ Make sure you set the global `audioStreaming` to `true`.
 
 If TGID is set to 0, all calls from all talkgroups will be sent. If TGID is set to a specific decimal value, only calls from that talkgroup will be sent.
 
+## Audio Filtering
+
+The callstream plugin includes optional audio filtering to reduce artifacts commonly found in P25 digital audio, such as sharp static pops/clicks caused by IMBE vocoder errors or bit errors in transmission.
+
+Audio filtering is controlled via the `audio_filtering` configuration block:
+
+```json
+"audio_filtering": {
+    "enabled": true,
+    "spike_clipping": {
+        "enabled": true,
+        "threshold_percent": 85,
+        "clip_factor": 0.9
+    },
+    "smoothing": {
+        "enabled": false,
+        "window_size": 5
+    },
+    "high_pass_filter": {
+        "enabled": false,
+        "cutoff_hz": 200
+    }
+}
+```
+
+### Filter Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Enable/disable all audio filtering | `true` |
+| **Spike Clipping** |||
+| `spike_clipping.enabled` | Enable spike detection and soft clipping | `true` |
+| `spike_clipping.threshold_percent` | Amplitude threshold as % of INT16_MAX (32767) | `85` |
+| `spike_clipping.clip_factor` | How aggressively to clip spikes (0.5-1.0) | `0.9` |
+| **Smoothing** |||
+| `smoothing.enabled` | Enable moving average smoothing | `false` |
+| `smoothing.window_size` | Number of samples for moving average window | `5` |
+| **High-Pass Filter** |||
+| `high_pass_filter.enabled` | Enable high-pass filter to remove low-frequency tones | `false` |
+| `high_pass_filter.cutoff_hz` | Cutoff frequency in Hz | `200` |
+
+### Filter Descriptions
+
+- **Spike Clipping**: Detects sudden amplitude spikes (typically caused by P25 decoding errors) and soft-clips them to reduce sharp clicks/pops. This is the most effective filter for P25 artifacts and is enabled by default.
+
+- **Smoothing**: Applies a moving average filter to smooth out sudden transitions. Can help with residual artifacts but may slightly blur rapid speech transitions. Disabled by default.
+
+- **High-Pass Filter**: Removes low-frequency tonal artifacts (beeps, chirps) below the cutoff frequency. May affect bass content in voice audio. Disabled by default.
+
+### Example Configuration
+
+Here's a complete example with audio filtering enabled:
+
+```json
+"plugins": [
+    {
+        "name":"callstream",
+        "library":"libcallstream.so",
+        "clients":[
+            {
+                "address":"192.168.1.122",
+                "port":9123
+            }
+        ],
+        "streams":[
+            {
+                "TGID":0,
+                "shortName":"EMS"
+            }
+        ],
+        "audio_filtering": {
+            "enabled": true,
+            "spike_clipping": {
+                "enabled": true,
+                "threshold_percent": 85,
+                "clip_factor": 0.9
+            },
+            "smoothing": {
+                "enabled": false,
+                "window_size": 5
+            },
+            "high_pass_filter": {
+                "enabled": false,
+                "cutoff_hz": 200
+            }
+        }
+    }
+]
+```
+
 You might consider disabling these [per-system settings](https://trunkrecorder.com/docs/CONFIGURE) in trunk-recorder, if you're not using them for another purpose:
 * `audioArchive` - this setting controls whether or not trunk-recorder writes WAV files to disk after it processes calls. Since `callstream` sends the same data over the wire to your clients, this is wasted processing.
 * `compressWav` - this setting controls whether WAVs are compressed before writing them to disk (something needed for other plugins like openmhz), which is unnecessary if `audioArchive` is disabled
