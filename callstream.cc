@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <algorithm>
+#include <cstdint>
 
 using namespace boost::asio;
 namespace asio = boost::asio;
@@ -54,6 +56,23 @@ struct audio_filter_config_t {
   } high_pass_filter;
 };
 
+static inline int16_t clamp_int16(float value) {
+  if (value > 32767.0f) {
+    return 32767;
+  }
+  if (value < -32768.0f) {
+    return -32768;
+  }
+  return static_cast<int16_t>(value);
+}
+
+static inline int16_t median3_int16(int16_t a, int16_t b, int16_t c) {
+  if (a > b) std::swap(a, b);
+  if (b > c) std::swap(b, c);
+  if (a > b) std::swap(a, b);
+  return b;
+}
+
 // Parse audio filtering configuration from JSON
 audio_filter_config_t parse_audio_filter_config(json config_data) {
   audio_filter_config_t cfg;
@@ -71,8 +90,8 @@ audio_filter_config_t parse_audio_filter_config(json config_data) {
   if (af.contains("spike_clipping")) {
     auto& sc = af["spike_clipping"];
     cfg.spike_clipping.enabled = sc.value("enabled", true);
-    cfg.spike_clipping.threshold_percent = sc.value("threshold_percent", 85);
-    cfg.spike_clipping.clip_factor = sc.value("clip_factor", 0.9f);
+    cfg.spike_clipping.threshold_percent = std::clamp(sc.value("threshold_percent", 85), 1, 100);
+    cfg.spike_clipping.clip_factor = std::clamp(sc.value("clip_factor", 0.9f), 0.0f, 1.0f);
     // Calculate threshold value from percentage (INT16_MAX = 32767)
     cfg.spike_clipping.threshold = static_cast<int16_t>(32767 * cfg.spike_clipping.threshold_percent / 100.0f);
   } else {
@@ -84,14 +103,14 @@ audio_filter_config_t parse_audio_filter_config(json config_data) {
   if (af.contains("smoothing")) {
     auto& sm = af["smoothing"];
     cfg.smoothing.enabled = sm.value("enabled", false);
-    cfg.smoothing.window_size = sm.value("window_size", 5);
+    cfg.smoothing.window_size = std::max(1, sm.value("window_size", 5));
   }
 
   // High-pass filter
   if (af.contains("high_pass_filter")) {
     auto& hp = af["high_pass_filter"];
     cfg.high_pass_filter.enabled = hp.value("enabled", false);
-    cfg.high_pass_filter.cutoff_hz = hp.value("cutoff_hz", 200);
+    cfg.high_pass_filter.cutoff_hz = std::max(1, hp.value("cutoff_hz", 200));
   }
 
   return cfg;
@@ -108,6 +127,15 @@ public:
     hp_state = 0.0f;
     prev_sample = 0;
     hp_alpha = 0.0f;
+    smoothing_state = 0.0f;
+    smoothing_initialized = false;
+    clip_prev_sample = 0;
+    clip_prev2_sample = 0;
+    hp_events = 0;
+    clip_events = 0;
+    smooth_events = 0;
+    max_abs_input = 0;
+    max_abs_output = 0;
     smoothing_buffer.clear();
   }
   int magic;
@@ -122,7 +150,16 @@ public:
   int smoothing_window = 5;
   float hp_state;      // High-pass filter state (y[n-1])
   int16_t prev_sample; // Previous sample for high-pass filter (x[n-1])
-  float hp_alpha;      // High-pass filter coefficient
+  float hp_alpha;      // DC-blocker feedback coefficient
+  float smoothing_state;
+  bool smoothing_initialized;
+  int16_t clip_prev_sample;
+  int16_t clip_prev2_sample;
+  uint64_t hp_events;
+  uint64_t clip_events;
+  uint64_t smooth_events;
+  int32_t max_abs_input;
+  int32_t max_abs_output;
 };
 
 class sftp_buffer_info_t {
@@ -243,8 +280,12 @@ class Call_Stream : public Plugin_Api {
     const float sample_rate = 8000.0f;
     if (g_audio_filter_config.high_pass_filter.enabled) {
       float fc = static_cast<float>(g_audio_filter_config.high_pass_filter.cutoff_hz);
-      // First-order high-pass filter coefficient: alpha = (fc / sr) / (1 + fc / sr)
-      g_audio_filter_config.high_pass_filter.alpha = (fc / sample_rate) / (1.0f + fc / sample_rate);
+      // DC-blocking high-pass: y[n] = x[n] - x[n-1] + alpha * y[n-1]
+      // alpha in (0,1) controls low-frequency rejection and speech preservation.
+      constexpr float pi = 3.14159265358979323846f;
+      const float normalized = 2.0f * pi * fc / sample_rate;
+      g_audio_filter_config.high_pass_filter.alpha = std::exp(-normalized);
+      g_audio_filter_config.high_pass_filter.alpha = std::clamp(g_audio_filter_config.high_pass_filter.alpha, 0.0f, 0.9999f);
       BOOST_LOG_TRIVIAL(debug) << "libcallstream: calculated high-pass filter alpha="
         << g_audio_filter_config.high_pass_filter.alpha;
     }
@@ -296,6 +337,14 @@ class Call_Stream : public Plugin_Api {
     call_data->magic = 0x415A5A50; // 'pzza'
     call_data->json_string = json_object.dump();
     call_data->json_length = call_data->json_string.length();
+    if (g_audio_filter_config.enabled) {
+      BOOST_LOG_TRIVIAL(debug) << "libcallstream: filter stats call id " << unique_id
+        << " in_peak=" << call_data->max_abs_input
+        << " out_peak=" << call_data->max_abs_output
+        << " hp_events=" << call_data->hp_events
+        << " clip_events=" << call_data->clip_events
+        << " smooth_events=" << call_data->smooth_events;
+    }
     send(callstream, call_data, unique_id);
     return 0;
   }
@@ -404,46 +453,85 @@ private:
     // Initialize filter parameters from global config
     call_data->smoothing_window = g_audio_filter_config.smoothing.window_size;
     call_data->hp_alpha = g_audio_filter_config.high_pass_filter.alpha;
+    const float smoothing_beta = 2.0f / static_cast<float>(call_data->smoothing_window + 1);
 
     for (int i = 0; i < sample_count; i++) {
       int16_t sample = samples[i];
       int16_t original_sample = sample;  // Keep original for all filters
+      int32_t abs_input = std::abs(static_cast<int32_t>(original_sample));
+      if (abs_input > call_data->max_abs_input) {
+        call_data->max_abs_input = abs_input;
+      }
 
       if (g_audio_filter_config.enabled) {
-        // Strategy 3: First-order High-Pass Filter (applied first on original signal)
-        if (g_audio_filter_config.high_pass_filter.enabled) {
-          float sample_f = static_cast<float>(original_sample);
-          // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
-          float filtered = call_data->hp_alpha * (call_data->hp_state + sample_f - static_cast<float>(call_data->prev_sample));
-          call_data->prev_sample = original_sample;
-          call_data->hp_state = filtered;
-          sample = static_cast<int16_t>(filtered);
-        }
-
-        // Strategy 1: Spike Detection and Soft Clipping (applied after high-pass)
+        // Strategy 1: Spike Detection and Soft Clipping (applied first to avoid HP amplifying clicks)
         if (g_audio_filter_config.spike_clipping.enabled) {
+          const int32_t threshold = g_audio_filter_config.spike_clipping.threshold;
+          const float clip_factor = g_audio_filter_config.spike_clipping.clip_factor;
+
+          // Delta limiter catches narrow clicks even when absolute amplitude is modest.
+          const int32_t delta_limit = std::max<int32_t>(256, threshold / 10);
+          int32_t delta = static_cast<int32_t>(sample) - static_cast<int32_t>(call_data->clip_prev_sample);
+          int32_t abs_delta = std::abs(delta);
+          if (abs_delta > delta_limit) {
+            const int32_t sign = (delta < 0) ? -1 : 1;
+            const float excess = static_cast<float>(abs_delta - delta_limit);
+            const float limited_abs_delta = static_cast<float>(delta_limit) + excess * clip_factor;
+            sample = clamp_int16(static_cast<float>(call_data->clip_prev_sample) + (static_cast<float>(sign) * limited_abs_delta));
+            call_data->clip_events++;
+          }
+
+          // Median suppresses isolated impulse outliers with minimal impact to speech.
+          int32_t d1 = std::abs(static_cast<int32_t>(sample) - static_cast<int32_t>(call_data->clip_prev_sample));
+          int32_t d2 = std::abs(static_cast<int32_t>(sample) - static_cast<int32_t>(call_data->clip_prev2_sample));
+          if (d1 > delta_limit && d2 > delta_limit) {
+            sample = median3_int16(sample, call_data->clip_prev_sample, call_data->clip_prev2_sample);
+            call_data->clip_events++;
+          }
+
           int32_t abs_sample = std::abs(static_cast<int32_t>(sample));
           if (abs_sample > g_audio_filter_config.spike_clipping.threshold) {
-            // Soft clip: reduce amplitude proportionally
-            float scaled = static_cast<float>(sample) * g_audio_filter_config.spike_clipping.clip_factor;
-            sample = static_cast<int16_t>(scaled);
+            // Soft clip only the amount above threshold; preserves normal speech dynamics.
+            const int32_t sign = (sample < 0) ? -1 : 1;
+            const float excess = static_cast<float>(abs_sample - threshold);
+            const float clipped_abs = static_cast<float>(threshold) + excess * clip_factor;
+            sample = clamp_int16(static_cast<float>(sign) * clipped_abs);
+            call_data->clip_events++;
           }
+          call_data->clip_prev2_sample = call_data->clip_prev_sample;
+          call_data->clip_prev_sample = sample;
         }
 
-        // Strategy 2: Moving Average Smoothing (applied last for final smoothing)
+        // Strategy 3: DC-blocking high-pass filter
+        if (g_audio_filter_config.high_pass_filter.enabled) {
+          float sample_f = static_cast<float>(sample);
+          // y[n] = x[n] - x[n-1] + alpha * y[n-1]
+          float filtered = sample_f - static_cast<float>(call_data->prev_sample) + (call_data->hp_alpha * call_data->hp_state);
+          call_data->prev_sample = sample;
+          call_data->hp_state = filtered;
+          sample = clamp_int16(filtered);
+          call_data->hp_events++;
+        }
+
+        // Strategy 2: Exponential smoothing (less speech smearing than moving average)
         if (g_audio_filter_config.smoothing.enabled) {
-          call_data->smoothing_buffer.push_back(sample);
-          if (static_cast<int>(call_data->smoothing_buffer.size()) > call_data->smoothing_window) {
-            call_data->smoothing_buffer.pop_front();
+          if (!call_data->smoothing_initialized) {
+            call_data->smoothing_state = static_cast<float>(sample);
+            call_data->smoothing_initialized = true;
+          } else {
+            call_data->smoothing_state += smoothing_beta * (static_cast<float>(sample) - call_data->smoothing_state);
           }
-
-          // Calculate moving average
-          int32_t sum = 0;
-          for (auto s : call_data->smoothing_buffer) {
-            sum += s;
+          int16_t smoothed = clamp_int16(call_data->smoothing_state);
+          if (smoothed != sample) {
+            call_data->smooth_events++;
           }
-          sample = static_cast<int16_t>(sum / call_data->smoothing_buffer.size());
+          sample = smoothed;
         }
+      }
+
+      int32_t abs_output = std::abs(static_cast<int32_t>(sample));
+      if (abs_output > call_data->max_abs_output) {
+        call_data->max_abs_output = abs_output;
       }
 
       call_data->samples.push_back(sample);

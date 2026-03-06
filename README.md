@@ -9,11 +9,9 @@ This plugin was designed to work with [pizzawave](https://github.com/lilhoser/pi
 
 # Installation
 
-* Copy the contents of this repo to `trunk-recorder/plugins/callstream`
-* Update `trunk-recorder/CMakeLists.txt`:
-```
-add_subdirectory(plugins/callstream)
-```
+***Note: To automate installation of this plugin, see [this bash script](https://github.com/lilhoser/pizzawave/scripts/setup_trunk_recorder.sh).***
+
+* Copy the contents of this repo to a new folder, `trunk-recorder/user_plugins/callstream`
 * [Rebuild trunk-recorder](https://trunkrecorder.com/docs/Install/INSTALL-LINUX)
 ```
 cd trunk-build
@@ -26,36 +24,32 @@ sudo make install
 
 Add the following code to your trunk-recorder's JSON configuration:
 
-```
+```json
 "plugins": [
-        {
-            "name":"callstream",
-            "library":"libcallstream.so",
-            "clients":[
-                {
-                    "address":"192.168.1.122",
-                    "port":9123
-                },
-                {
-                    "address":"192.168.1.54",
-                    "port":9123
-                }
-            ],
-            "streams":[
-                {
-                    "TGID":0,
-                    "shortName":"<system name>"
-                }
-            ],
-            "sftp_info":{
-                "server_address": "<address>",
-                "user": "<user>",
-                "password": "<password>",
-                "dest": "myfolder/mysubfolder",
-                "verbose": false
+    {
+        "name":"callstream",
+        "library":"libcallstream.so",
+        "clients":[
+            {
+                "address":"192.168.1.122",
+                "port":9123
             }
+        ],
+        "streams":[
+            {
+                "TGID":0,
+                "shortName":"<system name>"
+            }
+        ],
+        "sftp_info":{
+            "server_address": "<address>",
+            "user": "<user>",
+            "password": "<password>",
+            "dest": "myfolder/mysubfolder",
+            "verbose": false
         }
-    ]
+    }
+]
 ```
 
 Make sure you set the global `audioStreaming` to `true`.
@@ -98,10 +92,10 @@ Audio filtering is controlled via the `audio_filtering` configuration block:
 | **Spike Clipping** |||
 | `spike_clipping.enabled` | Enable spike detection and soft clipping | `true` |
 | `spike_clipping.threshold_percent` | Amplitude threshold as % of INT16_MAX (32767) | `85` |
-| `spike_clipping.clip_factor` | How aggressively to clip spikes (0.5-1.0) | `0.9` |
+| `spike_clipping.clip_factor` | How aggressively to clip spikes (0.0-1.0) | `0.9` |
 | **Smoothing** |||
 | `smoothing.enabled` | Enable moving average smoothing | `false` |
-| `smoothing.window_size` | Number of samples for moving average window | `5` |
+| `smoothing.window_size` | Smoothing strength (larger = smoother, less detail) | `5` |
 | **High-Pass Filter** |||
 | `high_pass_filter.enabled` | Enable high-pass filter to remove low-frequency tones | `false` |
 | `high_pass_filter.cutoff_hz` | Cutoff frequency in Hz | `200` |
@@ -110,7 +104,7 @@ Audio filtering is controlled via the `audio_filtering` configuration block:
 
 - **Spike Clipping**: Detects sudden amplitude spikes (typically caused by P25 decoding errors) and soft-clips them to reduce sharp clicks/pops. This is the most effective filter for P25 artifacts and is enabled by default.
 
-- **Smoothing**: Applies a moving average filter to smooth out sudden transitions. Can help with residual artifacts but may slightly blur rapid speech transitions. Disabled by default.
+- **Smoothing**: Applies exponential smoothing to reduce rough edges with less latency and smearing than a moving average. Disabled by default.
 
 - **High-Pass Filter**: Removes low-frequency tonal artifacts (beeps, chirps) below the cutoff frequency. May affect bass content in voice audio. Disabled by default.
 
