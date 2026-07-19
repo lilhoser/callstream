@@ -59,6 +59,23 @@ Make sure you set the global `audioStreaming` to `true`.
 
 If TGID is set to 0, all calls from all talkgroups will be sent. If TGID is set to a specific decimal value, only calls from that talkgroup will be sent.
 
+## RF Telemetry
+
+The optional `rf_telemetry` block emits passive, versioned JSON events through
+the Trunk Recorder log. It does not retune a receiver or access SDR hardware.
+
+```json
+"rf_telemetry": {
+    "enabled": true,
+    "sample_interval_seconds": 15
+}
+```
+
+Periodic samples and reacquisition events are prefixed with `PIZZAWAVE_RF`.
+Matching Trunk Recorder builds emit retunes with the `TR_RF` prefix. Signal
+power and noise are not included because Trunk Recorder does not currently
+expose reliable control-channel measurements for those values.
+
 ## Audio Filtering
 
 The callstream plugin includes optional audio filtering to reduce artifacts commonly found in P25 digital audio, such as sharp static pops/clicks caused by IMBE vocoder errors or bit errors in transmission.

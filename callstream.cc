@@ -1,6 +1,7 @@
 #include "../../trunk-recorder/call_concluder/call_concluder.h"
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
 #include "../../trunk-recorder/recorders/recorder.h"
+#include "../../trunk-recorder/source.h"
 #include <boost/dll/alias.hpp> // for BOOST_DLL_ALIAS
 #include <boost/foreach.hpp>
 #include <boost/asio.hpp>
@@ -17,6 +18,7 @@
 #include <deque>
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 
 using namespace boost::asio;
 namespace asio = boost::asio;
@@ -202,6 +204,20 @@ asio::io_service::work g_work(g_context);
 std::thread g_WorkerThread;
 audio_filter_config_t g_audio_filter_config;  // Global audio filter configuration
 
+struct rf_telemetry_config_t {
+  bool enabled = false;
+  double sample_interval_seconds = 15.0;
+};
+
+struct rf_telemetry_state_t {
+  double sample_elapsed_seconds = 0.0;
+  double low_decode_seconds = 0.0;
+  bool was_low_decode = false;
+};
+
+rf_telemetry_config_t g_rf_telemetry_config;
+std::unordered_map<System *, rf_telemetry_state_t> g_rf_telemetry_state;
+
 class Call_Stream : public Plugin_Api {
 
   public:
@@ -260,6 +276,14 @@ class Call_Stream : public Plugin_Api {
     // Parse audio filtering configuration
     g_audio_filter_config = parse_audio_filter_config(config_data);
 
+    if (config_data.contains("rf_telemetry")) {
+      auto &telemetry = config_data["rf_telemetry"];
+      g_rf_telemetry_config.enabled = telemetry.value("enabled", false);
+      g_rf_telemetry_config.sample_interval_seconds = std::clamp(telemetry.value("sample_interval_seconds", 15.0), 3.0, 300.0);
+    }
+    BOOST_LOG_TRIVIAL(info) << "libcallstream: RF telemetry " << (g_rf_telemetry_config.enabled ? "enabled" : "disabled")
+                            << " (sample interval " << g_rf_telemetry_config.sample_interval_seconds << "s)";
+
     // Log audio filter configuration
     BOOST_LOG_TRIVIAL(info) << "libcallstream: audio filtering " << (g_audio_filter_config.enabled ? "enabled" : "disabled");
     if (g_audio_filter_config.enabled) {
@@ -288,6 +312,43 @@ class Call_Stream : public Plugin_Api {
       g_audio_filter_config.high_pass_filter.alpha = std::clamp(g_audio_filter_config.high_pass_filter.alpha, 0.0f, 0.9999f);
       BOOST_LOG_TRIVIAL(debug) << "libcallstream: calculated high-pass filter alpha="
         << g_audio_filter_config.high_pass_filter.alpha;
+    }
+
+    return 0;
+  }
+
+  int system_rates(std::vector<System *> systems, float timeDiff) override {
+    if (!g_rf_telemetry_config.enabled || timeDiff <= 0) {
+      return 0;
+    }
+
+    for (System *system : systems) {
+      if (system == nullptr || system->control_channel_count() == 0) {
+        continue;
+      }
+
+      int decode_rate = static_cast<int>(std::floor(system->get_message_count() / timeDiff));
+      auto &state = g_rf_telemetry_state[system];
+      bool low_decode = decode_rate < 2;
+
+      if (low_decode) {
+        state.low_decode_seconds += timeDiff;
+      } else if (state.was_low_decode) {
+        json event = make_rf_event("control_channel_reacquired", system, decode_rate);
+        event["lowDecodeSeconds"] = state.low_decode_seconds;
+        emit_rf_event(event);
+        state.low_decode_seconds = 0.0;
+      }
+      state.was_low_decode = low_decode;
+
+      state.sample_elapsed_seconds += timeDiff;
+      if (state.sample_elapsed_seconds >= g_rf_telemetry_config.sample_interval_seconds) {
+        json event = make_rf_event("rf_sample", system, decode_rate);
+        event["sampleWindowSeconds"] = timeDiff;
+        event["lowDecodeSeconds"] = state.low_decode_seconds;
+        emit_rf_event(event);
+        state.sample_elapsed_seconds = std::fmod(state.sample_elapsed_seconds, g_rf_telemetry_config.sample_interval_seconds);
+      }
     }
 
     return 0;
@@ -387,6 +448,29 @@ class Call_Stream : public Plugin_Api {
   }
 
 private:
+
+  json make_rf_event(const char *event_name, System *system, int decode_rate) {
+    Source *source = system->get_source();
+    return {
+        {"schemaVersion", 1},
+        {"event", event_name},
+        {"timestampUnixMs", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()},
+        {"systemShortName", system->get_short_name()},
+        {"systemType", system->get_system_type()},
+        {"controlChannelHz", system->get_current_control_channel()},
+        {"decodeRate", decode_rate},
+        {"frequencyErrorHz", system->get_freq_error()},
+        {"sourceIndex", source == nullptr ? -1 : source->get_num()},
+        {"sourceCenterHz", source == nullptr ? 0 : source->get_center()},
+        {"sourceSampleRate", source == nullptr ? 0 : source->get_rate()},
+        {"sourceErrorHz", source == nullptr ? 0 : source->get_error()},
+        {"sourceDriver", source == nullptr ? "" : source->get_driver()},
+        {"sourceDevice", source == nullptr ? "" : source->get_device()}};
+  }
+
+  void emit_rf_event(const json &event) {
+    BOOST_LOG_TRIVIAL(info) << "PIZZAWAVE_RF " << event.dump();
+  }
 
   inline std::string make_unique_id(long call_id) {
     // NB: TR engine should really provide this to us as UUID so plugins arent all doing different IDs.
