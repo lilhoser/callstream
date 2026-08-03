@@ -169,7 +169,7 @@ Here's a complete example with audio filtering enabled:
 You might consider disabling these [per-system settings](https://trunkrecorder.com/docs/CONFIGURE) in trunk-recorder, if you're not using them for another purpose:
 * `audioArchive` - this setting controls whether or not trunk-recorder writes WAV files to disk after it processes calls. Since `callstream` sends the same data over the wire to your clients, this is wasted processing.
 * `compressWav` - this setting controls whether WAVs are compressed before writing them to disk (something needed for other plugins like openmhz), which is unnecessary if `audioArchive` is disabled
-* `transmissionArchive` - this setting should always be disabled unless you are performing low-level diagnostics
+* `transmissionArchive` - keep this disabled unless you are performing low-level diagnostics. Trunk Recorder still creates temporary per-transmission files while concluding a call; this setting controls whether those files are retained afterward. Callstream version 2 can use the temporary files to recover exact transmission audio when its live PCM buffer does not align.
 
 The `sftp_info` block specifies an SFTP server to upload callstream records. This block is optional and can be removed. It is a useful option if you don't want to rely on a live streaming capability or would prefer to backup all callstream records for offline consumption (perhaps in addition to live streaming). In pizzawave parlance, this is known as an "offline capture".
 
@@ -191,18 +191,48 @@ If you're writing your own client to consume call data sent by this plugin, you 
 
 This data is guaranteed to be sent in this order.  Note at the time of writing, that the sample data is recorded by trunk-recorder as 16-bit, 1 channel, 8khz sampling rate.
 
-JSON structure:
+Version 3 JSON structure extends version 2 without changing the binary framing:
 
-| Field Name             | Length (bytes) |  Description            |
-| ---------------------- | -------------- | ----------------------- |
-| Source                 | 4              | Recorder source         |
-| Talkgroup              | 8              | Talkgroup ID            |
-| PatchedTalkgroups      | (variable)     | array of patched TGs    |
-| Frequency              | (variable)     | The call frequency      |
-| SystemShortName        | (variable)     | The name of the system  |
-| CallId                 | 4              | The ID of the call      |
-| StartTime              | 8              | Unix seconds            |
-| StopTime               | 8              | Unix seconds            |
+| Field Name             | Description                                                        |
+| ---------------------- | ------------------------------------------------------------------ |
+| SchemaVersion          | Protocol version, currently `3`                                     |
+| ChannelAssignmentStart | `grant` when the original assignment was observed; otherwise `update` |
+| BeginsChannelAssignment | True only when `ChannelAssignmentStart` is `grant`                 |
+| PossiblyIncompleteTransmissionStartTimeMs | Original first-transmission start for an update-created call; null for a grant |
+| SystemNumber           | Trunk Recorder system number; this is not a transmitting radio ID  |
+| SystemShortName        | The name of the system                                              |
+| CallId                 | Trunk Recorder's parent call number                                |
+| Talkgroup              | Parent talkgroup ID                                                |
+| PatchedTalkgroups      | Array of patched talkgroups                                        |
+| Frequency              | Parent call frequency                                             |
+| StartTime / StopTime   | Unix seconds retained for version 1 client compatibility           |
+| StartTimeMs / StopTimeMs | Unix milliseconds                                                |
+| SampleRate             | PCM sample rate                                                    |
+| AudioMappingStatus     | `exact_live`, `exact_reconstructed`, or `unavailable`              |
+| Transmissions          | Ordered array of decoder-delimited push-to-talk transmissions      |
+
+Each transmission contains `SourceId`, `SourceIdProvenance`, `StartStatus`, `Talkgroup`,
+`StartTimeMs`, `StopTimeMs`, `StartSample`, `SampleCount`, `Frequency`,
+`TdmaSlot`, `ErrorCount`, and `SpikeCount`. `SourceId` is null when the radio
+identifier was not decoded. `StartSample` is null only when exact audio mapping
+is unavailable. `StartStatus` is `possibly_incomplete` only for the first
+transmission of a call created from an update; later transmissions are
+`observed_boundary`.
+
+Callstream omits a source-less transmission only when its temporary WAV is
+successfully inspected and every sample remains at the observed decoder noise
+floor. A source-less transmission with any signal above that floor is retained.
+If inspection or exact reconstruction fails, Callstream retains the
+transmission. When an empty fragment is omitted, Callstream reconstructs the
+outgoing PCM so the transmission table still covers the complete payload.
+
+For exact mappings, transmission ranges are contiguous, begin at sample zero,
+and cover the entire PCM payload exactly. Callstream first compares its
+in-memory PCM count with Trunk Recorder's retained transmission counts. On a
+mismatch it reconstructs the outgoing PCM from Trunk Recorder's temporary
+per-transmission WAV files and reapplies the configured Callstream filters. If
+neither route can establish an exact mapping, the parent recording is still
+sent with `AudioMappingStatus` set to `unavailable`; offsets are not invented.
 
 
 # What's up with the name?

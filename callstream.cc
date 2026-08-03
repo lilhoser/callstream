@@ -18,7 +18,10 @@
 #include <deque>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
+#include "callstream_v2_audio.h"
+#include "callstream_v3_capture.h"
 
 using namespace boost::asio;
 namespace asio = boost::asio;
@@ -385,8 +388,55 @@ class Call_Stream : public Plugin_Api {
       destroy_call(callstream, unique_id);
       return 0;
     }
+    std::string audio_mapping_status;
+    std::vector<size_t> retained_transmission_indices;
+    const bool exact_audio_mapping = prepare_transmission_audio(
+        call_data, call_info, audio_mapping_status, retained_transmission_indices);
+    if (!call_info.transmission_list.empty() && retained_transmission_indices.empty() &&
+        exact_audio_mapping && audio_mapping_status == "exact_reconstructed") {
+      BOOST_LOG_TRIVIAL(info) << "libcallstream: omitting call " << call_info.call_num
+                              << " because it contains no identified or acoustically non-empty transmissions";
+      destroy_call(callstream, unique_id);
+      return 0;
+    }
+    json transmissions = json::array();
+    int64_t start_sample = 0;
+    for (size_t transmission_index : retained_transmission_indices) {
+      const auto& transmission = call_info.transmission_list[transmission_index];
+      json item = {
+          {"SourceId", transmission.source > 0 ? json(transmission.source) : json(nullptr)},
+          {"SourceIdProvenance", "unknown"},
+          {"StartStatus", callstream_v3::transmission_start_status(
+              call_info.was_update,
+              call_info.possibly_incomplete_transmission_start_time_ms,
+              transmission.start_time_ms)},
+          {"Talkgroup", transmission.talkgroup},
+          {"StartTimeMs", transmission.start_time_ms},
+          {"StopTimeMs", transmission.stop_time_ms},
+          {"SampleCount", transmission.sample_count},
+          {"Frequency", call_info.freq},
+          {"TdmaSlot", transmission.slot},
+          {"ErrorCount", transmission.error_count},
+          {"SpikeCount", transmission.spike_count}
+      };
+      if (exact_audio_mapping) {
+        item["StartSample"] = start_sample;
+        start_sample += transmission.sample_count;
+      } else {
+        item["StartSample"] = nullptr;
+      }
+      transmissions.push_back(std::move(item));
+    }
+
     json json_object = {
-        {"Source", call_info.sys_num},
+        {"SchemaVersion", 3},
+        {"ChannelAssignmentStart", callstream_v3::channel_assignment_start(call_info.was_update)},
+        {"BeginsChannelAssignment", !call_info.was_update},
+        {"PossiblyIncompleteTransmissionStartTimeMs",
+         call_info.possibly_incomplete_transmission_start_time_ms > 0
+             ? json(call_info.possibly_incomplete_transmission_start_time_ms)
+             : json(nullptr)},
+        {"SystemNumber", call_info.sys_num},
         {"Talkgroup", call_info.talkgroup},
         {"PatchedTalkgroups",call_info.patched_talkgroups},
         {"Frequency", call_info.freq},
@@ -394,6 +444,11 @@ class Call_Stream : public Plugin_Api {
         {"CallId", call_info.call_num},
         {"StartTime", call_info.start_time},
         {"StopTime", call_info.stop_time},
+        {"StartTimeMs", call_info.start_time_ms},
+        {"StopTimeMs", call_info.stop_time_ms},
+        {"SampleRate", 8000},
+        {"AudioMappingStatus", audio_mapping_status},
+        {"Transmissions", std::move(transmissions)},
     };
     call_data->magic = 0x415A5A50; // 'pzza'
     call_data->json_string = json_object.dump();
@@ -448,6 +503,144 @@ class Call_Stream : public Plugin_Api {
   }
 
 private:
+
+  void reset_call_audio(calldata_t* call_data) {
+    auto mut = call_data->mutex;
+    boost::lock_guard<boost::shared_mutex> lock(*mut);
+    call_data->sample_count = 0;
+    call_data->samples.clear();
+    call_data->smoothing_buffer.clear();
+    call_data->hp_state = 0.0f;
+    call_data->prev_sample = 0;
+    call_data->smoothing_state = 0.0f;
+    call_data->smoothing_initialized = false;
+    call_data->clip_prev_sample = 0;
+    call_data->clip_prev2_sample = 0;
+    call_data->hp_events = 0;
+    call_data->clip_events = 0;
+    call_data->smooth_events = 0;
+    call_data->max_abs_input = 0;
+    call_data->max_abs_output = 0;
+  }
+
+  bool prepare_transmission_audio(calldata_t* call_data, const Call_Data_t& call_info,
+                                  std::string& mapping_status,
+                                  std::vector<size_t>& retained_indices) {
+    retained_indices.clear();
+    retained_indices.reserve(call_info.transmission_list.size());
+    for (size_t index = 0; index < call_info.transmission_list.size(); ++index) {
+      retained_indices.push_back(index);
+    }
+    int64_t expected_samples = 0;
+    for (size_t index = 0; index < call_info.transmission_list.size(); ++index) {
+      const auto& transmission = call_info.transmission_list[index];
+      if (transmission.sample_count <= 0 ||
+          expected_samples > std::numeric_limits<int>::max() - transmission.sample_count) {
+        mapping_status = "unavailable";
+        return false;
+      }
+      expected_samples += transmission.sample_count;
+    }
+
+    std::vector<size_t> filtered_indices;
+    filtered_indices.reserve(retained_indices.size());
+    for (size_t index : retained_indices) {
+      const auto& transmission = call_info.transmission_list[index];
+      if (transmission.source > 0) {
+        filtered_indices.push_back(index);
+        continue;
+      }
+
+      std::vector<int16_t> samples;
+      unsigned int sample_rate = 0;
+      if (!callstream_v2::read_pcm16_mono_wav(transmission.filename, samples, sample_rate) ||
+          sample_rate != 8000 || samples.size() != static_cast<size_t>(transmission.sample_count)) {
+        BOOST_LOG_TRIVIAL(warning) << "libcallstream: could not inspect source-less transmission audio from "
+                                   << transmission.filename << "; retaining it for call " << call_info.call_num;
+        filtered_indices.push_back(index);
+        continue;
+      }
+      if (callstream_v2::should_retain_transmission(transmission.source, samples)) {
+        filtered_indices.push_back(index);
+      } else {
+        BOOST_LOG_TRIVIAL(info) << "libcallstream: omitting source-less acoustically empty transmission from call "
+                                << call_info.call_num << " (samples=" << transmission.sample_count << ")";
+      }
+    }
+
+    const bool excluded_empty_transmission = filtered_indices.size() != retained_indices.size();
+    if (excluded_empty_transmission) {
+      std::vector<std::vector<int16_t>> filtered_audio;
+      filtered_audio.reserve(filtered_indices.size());
+      bool reconstruction_available = true;
+      for (size_t index : filtered_indices) {
+        const auto& transmission = call_info.transmission_list[index];
+        std::vector<int16_t> samples;
+        unsigned int sample_rate = 0;
+        if (!callstream_v2::read_pcm16_mono_wav(transmission.filename, samples, sample_rate) ||
+            sample_rate != 8000 || samples.size() != static_cast<size_t>(transmission.sample_count)) {
+          reconstruction_available = false;
+          BOOST_LOG_TRIVIAL(error) << "libcallstream: cannot remove empty transmission because exact retained audio is unavailable from "
+                                   << transmission.filename << " for call " << call_info.call_num;
+          break;
+        }
+        filtered_audio.push_back(std::move(samples));
+      }
+
+      if (reconstruction_available) {
+        retained_indices = std::move(filtered_indices);
+        reset_call_audio(call_data);
+        for (auto& samples : filtered_audio) {
+          add_call_samples(call_data, samples.data(), static_cast<int>(samples.size()));
+        }
+        mapping_status = "exact_reconstructed";
+        return true;
+      }
+    }
+
+    {
+      auto mut = call_data->mutex;
+      boost::shared_lock<boost::shared_mutex> lock(*mut);
+      if (!call_info.transmission_list.empty() &&
+          call_data->sample_count == expected_samples &&
+          call_data->samples.size() == static_cast<size_t>(expected_samples)) {
+        mapping_status = "exact_live";
+        return true;
+      }
+    }
+
+    BOOST_LOG_TRIVIAL(warning) << "libcallstream: live PCM does not match retained transmission sample count; rebuilding exact payload for call "
+                               << call_info.call_num;
+    std::vector<std::vector<int16_t>> transmission_audio;
+    transmission_audio.reserve(call_info.transmission_list.size());
+    unsigned int common_sample_rate = 0;
+    for (const auto& transmission : call_info.transmission_list) {
+      std::vector<int16_t> samples;
+      unsigned int sample_rate = 0;
+      if (!callstream_v2::read_pcm16_mono_wav(transmission.filename, samples, sample_rate) ||
+          samples.size() != static_cast<size_t>(transmission.sample_count) ||
+          (common_sample_rate != 0 && common_sample_rate != sample_rate)) {
+        BOOST_LOG_TRIVIAL(error) << "libcallstream: unable to reconstruct exact transmission audio from "
+                                 << transmission.filename << " for call " << call_info.call_num;
+        mapping_status = "unavailable";
+        return false;
+      }
+      common_sample_rate = sample_rate;
+      transmission_audio.push_back(std::move(samples));
+    }
+
+    if (common_sample_rate != 8000 || transmission_audio.empty()) {
+      mapping_status = "unavailable";
+      return false;
+    }
+
+    reset_call_audio(call_data);
+    for (auto& samples : transmission_audio) {
+      add_call_samples(call_data, samples.data(), static_cast<int>(samples.size()));
+    }
+    mapping_status = "exact_reconstructed";
+    return true;
+  }
 
   json make_rf_event(const char *event_name, System *system, int decode_rate) {
     Source *source = system->get_source();

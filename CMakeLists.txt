@@ -18,3 +18,9 @@ if(NOT Gnuradio_VERSION VERSION_LESS "3.8")
 endif()
 
 install(TARGETS callstream LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/trunk-recorder)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(callstream_v2_audio_tests tests/callstream_v2_audio_tests.cc)
+  add_test(NAME callstream_v2_audio_tests COMMAND callstream_v2_audio_tests)
+endif()
