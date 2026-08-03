@@ -67,10 +67,9 @@ int main() {
 
   assert(std::string(callstream_v3::channel_assignment_start(false)) == "grant");
   assert(std::string(callstream_v3::channel_assignment_start(true)) == "update");
-  assert(std::string(callstream_v3::transmission_start_status(true, 1000, 1000)) == "possibly_incomplete");
-  assert(std::string(callstream_v3::transmission_start_status(true, 1000, 2000)) == "observed_boundary");
-  assert(std::string(callstream_v3::transmission_start_status(false, 1000, 1000)) == "observed_boundary");
-  assert(std::string(callstream_v3::transmission_start_status(true, 0, 2000)) == "observed_boundary");
+  assert(std::string(callstream_v3::transmission_start_status(true, true)) == "possibly_incomplete");
+  assert(std::string(callstream_v3::transmission_start_status(true, false)) == "observed_boundary");
+  assert(std::string(callstream_v3::transmission_start_status(false, true)) == "observed_boundary");
 
   std::remove(valid_path.c_str());
   std::remove(stereo_path.c_str());

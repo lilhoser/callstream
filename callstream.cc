@@ -407,9 +407,8 @@ class Call_Stream : public Plugin_Api {
           {"SourceId", transmission.source > 0 ? json(transmission.source) : json(nullptr)},
           {"SourceIdProvenance", "unknown"},
           {"StartStatus", callstream_v3::transmission_start_status(
-              call_info.was_update,
-              call_info.possibly_incomplete_transmission_start_time_ms,
-              transmission.start_time_ms)},
+              call_info.started_from_update,
+              transmission_index == 0)},
           {"Talkgroup", transmission.talkgroup},
           {"StartTimeMs", transmission.start_time_ms},
           {"StopTimeMs", transmission.stop_time_ms},
@@ -430,11 +429,11 @@ class Call_Stream : public Plugin_Api {
 
     json json_object = {
         {"SchemaVersion", 3},
-        {"ChannelAssignmentStart", callstream_v3::channel_assignment_start(call_info.was_update)},
-        {"BeginsChannelAssignment", !call_info.was_update},
+        {"ChannelAssignmentStart", callstream_v3::channel_assignment_start(call_info.started_from_update)},
+        {"BeginsChannelAssignment", !call_info.started_from_update},
         {"PossiblyIncompleteTransmissionStartTimeMs",
-         call_info.possibly_incomplete_transmission_start_time_ms > 0
-             ? json(call_info.possibly_incomplete_transmission_start_time_ms)
+         call_info.started_from_update && !call_info.transmission_list.empty()
+             ? json(call_info.transmission_list.front().start_time_ms)
              : json(nullptr)},
         {"SystemNumber", call_info.sys_num},
         {"Talkgroup", call_info.talkgroup},
